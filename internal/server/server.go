@@ -1,4 +1,4 @@
-// Package server provides the integration layer for wrale-fleet-metal
+// Package server provides the main server implementation for fleet-metal
 package server
 
 import (
@@ -7,32 +7,26 @@ import (
 	"log"
 	"net/http"
 	"sync"
+	"time"
 
 	"github.com/wrale/wrale-fleet-metal-hw/pkg/gpio"
 	"github.com/wrale/wrale-fleet-metal-hw/pkg/power"
+	"github.com/wrale/wrale-fleet-metal-hw/pkg/secure"
 	"github.com/wrale/wrale-fleet-metal-hw/pkg/thermal"
-	"github.com/wrale/wrale-fleet-metal-core/pkg/state"
-	"github.com/wrale/wrale-fleet-metal-diag/pkg/diagnostics"
 )
 
-// Server represents the main fleet-metal integration layer
+// Server represents the main fleet-metal server
 type Server struct {
 	mux sync.RWMutex
 
-	// Core configuration
-	deviceID string
-	httpAddr string
-
-	// Hardware layer
+	// Hardware subsystems
 	gpio     *gpio.Controller
 	power    *power.Manager
+	security *secure.Manager
 	thermal  *thermal.Monitor
 
-	// Core system layer
-	state    *state.Manager
-	diag     *diagnostics.Manager
-
-	// HTTP server
+	// Server configuration
+	deviceID   string
 	httpServer *http.Server
 	started    bool
 }
@@ -49,55 +43,62 @@ func New(cfg Config) (*Server, error) {
 		return nil, fmt.Errorf("device ID is required")
 	}
 
-	// Initialize hardware layer
+	// Initialize GPIO controller first
 	gpioCtrl, err := gpio.New()
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize GPIO: %w", err)
 	}
 
-	// Initialize managers
+	// Initialize power management
 	powerMgr, err := power.New(power.Config{
 		GPIO: gpioCtrl,
 		DeviceID: cfg.DeviceID,
+		OnPowerCritical: func(state power.PowerState) {
+			log.Printf("CRITICAL: Power state critical - battery: %.1f%%, voltage: %.1fV",
+				state.BatteryLevel, state.Voltage)
+		},
 	})
 	if err != nil {
-		return nil, fmt.Errorf("failed to initialize power manager: %w", err)
+		return nil, fmt.Errorf("failed to initialize power management: %w", err)
 	}
 
+	// Initialize thermal management
 	thermalMgr, err := thermal.New(thermal.Config{
 		GPIO: gpioCtrl,
 		DeviceID: cfg.DeviceID,
+		OnWarning: func(state thermal.ThermalState) {
+			log.Printf("WARNING: High temperature - CPU: %.1f°C, GPU: %.1f°C",
+				state.CPUTemp, state.GPUTemp)
+		},
+		OnCritical: func(state thermal.ThermalState) {
+			log.Printf("CRITICAL: Temperature critical - CPU: %.1f°C, GPU: %.1f°C",
+				state.CPUTemp, state.GPUTemp)
+		},
 	})
 	if err != nil {
-		return nil, fmt.Errorf("failed to initialize thermal manager: %w", err)
+		return nil, fmt.Errorf("failed to initialize thermal management: %w", err)
 	}
 
-	// Initialize core system layer
-	stateMgr, err := state.New(state.Config{
-		DeviceID: cfg.DeviceID,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to initialize state manager: %w", err)
-	}
-
-	// Initialize diagnostics
-	diagMgr, err := diagnostics.New(diagnostics.Config{
-		DeviceID: cfg.DeviceID,
+	// Initialize security management
+	securityMgr, err := secure.New(secure.Config{
 		GPIO: gpioCtrl,
+		DeviceID: cfg.DeviceID,
+		OnTamper: func(state secure.TamperState) {
+			log.Printf("ALERT: Security tamper detected - case: %v, motion: %v",
+				state.CaseOpen, state.MotionDetected)
+		},
 	})
 	if err != nil {
-		return nil, fmt.Errorf("failed to initialize diagnostics: %w", err)
+		return nil, fmt.Errorf("failed to initialize security management: %w", err)
 	}
 
 	// Create server instance
 	s := &Server{
-		deviceID:   cfg.DeviceID,
-		httpAddr:   cfg.HTTPAddr,
-		gpio:       gpioCtrl,
-		power:      powerMgr,
-		thermal:    thermalMgr,
-		state:      stateMgr,
-		diag:       diagMgr,
+		deviceID: cfg.DeviceID,
+		gpio:     gpioCtrl,
+		power:    powerMgr,
+		thermal:  thermalMgr,
+		security: securityMgr,
 	}
 
 	// Initialize HTTP server
@@ -119,7 +120,7 @@ func (s *Server) Run(ctx context.Context) error {
 	s.started = true
 	s.mux.Unlock()
 
-	// Start subsystems
+	// Start subsystem monitoring
 	go func() {
 		if err := s.power.Monitor(ctx); err != nil {
 			log.Printf("Power monitoring error: %v", err)
@@ -133,14 +134,8 @@ func (s *Server) Run(ctx context.Context) error {
 	}()
 
 	go func() {
-		if err := s.state.Run(ctx); err != nil {
-			log.Printf("State manager error: %v", err)
-		}
-	}()
-
-	go func() {
-		if err := s.diag.Run(ctx); err != nil {
-			log.Printf("Diagnostics error: %v", err)
+		if err := s.security.Monitor(ctx); err != nil {
+			log.Printf("Security monitoring error: %v", err)
 		}
 	}()
 
@@ -153,7 +148,7 @@ func (s *Server) Run(ctx context.Context) error {
 
 	// Wait for shutdown
 	<-ctx.Done()
-	
+
 	// Graceful shutdown
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -163,4 +158,17 @@ func (s *Server) Run(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// routes sets up the HTTP routing
+func (s *Server) routes() http.Handler {
+	mux := http.NewServeMux()
+
+	// Health check
+	mux.HandleFunc("/health", s.handleHealth)
+
+	// API routes
+	mux.HandleFunc("/api/v1/status", s.handleStatus)
+
+	return mux
 }
